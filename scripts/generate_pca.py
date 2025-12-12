@@ -1,0 +1,168 @@
+import os
+import argparse
+import glob
+import torch
+import time
+from PIL import Image
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import numpy as np
+from transformers import AutoImageProcessor, AutoModel
+
+PATCH_SIZE = 14 
+
+
+def get_args():
+    parser = argparse.ArgumentParser(description="Run DINOv3 PCA visualization on a folder of images.")
+    parser.add_argument("--input_dir", type=str, required=True, help="Directory containing input images.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save PCA visualizations.")
+    parser.add_argument("--model", type=str, default="facebook/dinov3-vits16-pretrain-lvd1689m", help="HuggingFace model ID.")
+    parser.add_argument("--img_size", type=int, default=770, help="Resize images to this size (should be divisible by patch size).")
+    return parser.parse_args()
+
+def load_model(model_name):
+    print(f"Loading model: {model_name}")
+    try:
+        processor = AutoImageProcessor.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name, device_map="auto")
+    except Exception as e:
+        print(f"Error loading model {model_name}: {e}")
+        raise e
+    return model, processor
+
+def run_pca(features, n_components=3):
+    # features: (N_patches, Dim)
+    pca = PCA(n_components=n_components)
+    pca.fit(features)
+    pca_features = pca.transform(features)
+    return pca_features
+
+def plot_pca(pca_features, h_patches, w_patches, save_path):
+    # pca_features: (N_patches, 3)
+    # Normalize to [0, 1] for RGB
+    pca_features = (pca_features - pca_features.min(0)) / (pca_features.max(0) - pca_features.min(0))
+    
+    # Reshape to (H_patches, W_patches, 3)
+    try:
+        pca_img = pca_features.reshape(h_patches, w_patches, 3)
+    except ValueError as e:
+        print(f"Error reshaping PCA: {e}. Expected {h_patches}x{w_patches}={h_patches*w_patches}, got {pca_features.shape[0]}")
+        return
+
+    plt.figure(figsize=(10, 10))
+    plt.imshow(pca_img)
+    plt.axis("off")
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+def main():
+    args = get_args()
+    
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+        
+    model, processor = load_model(args.model)
+    
+    # Get patch size from model config if possible
+    patch_size = getattr(model.config, "patch_size", 14) 
+    print(f"Using patch size: {patch_size}")
+
+    image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(glob.glob(os.path.join(args.input_dir, ext)))
+        image_files.extend(glob.glob(os.path.join(args.input_dir, ext.upper())))
+    
+    print(f"Found {len(image_files)} images.")
+    
+    inference_times = []
+    
+    for img_path in image_files:
+        print(f"Processing {img_path}...")
+        try:
+            img = Image.open(img_path).convert("RGB")
+            
+            # Helper to calculate grid size
+            # We resize manually to control aspect ratio and divisibility
+            w, h = img.size
+            if args.img_size > 0:
+                scale = args.img_size / min(w, h)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                
+                # Make divisible by patch_size (rounding down/up)
+                new_w = (new_w // patch_size) * patch_size
+                new_h = (new_h // patch_size) * patch_size
+                
+                # Ensure at least 1 patch
+                new_w = max(new_w, patch_size)
+                new_h = max(new_h, patch_size)
+                
+                img = img.resize((new_w, new_h), resample=Image.BICUBIC)
+            
+            w, h = img.size
+            h_patches = h // patch_size
+            w_patches = w // patch_size
+            
+            inputs = processor(images=img, return_tensors="pt", do_resize=False, do_center_crop=False)
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            
+            t_start = time.time()
+            with torch.inference_mode():
+                outputs = model(**inputs, output_hidden_states=True)
+                
+                # Get last hidden state
+                last_hidden_state = outputs.last_hidden_state # (B, Seq, Dim)
+                
+                # Remove CLS token (assuming index 0)
+                # Check model type to be sure, but standard ViT uses index 0.
+                # However, DINOv2 might have register tokens.
+                # If registers are present, we need to skip them too.
+                # DINOv3 might have them.
+                
+                # Let's verify sequence length vs patch count
+                B, Seq, Dim = last_hidden_state.shape
+                expected_patches = h_patches * w_patches
+                
+                # Usually: Seq = 1 (CLS) + [Registers] + Patches
+                prefix_tokens = Seq - expected_patches
+                
+                if prefix_tokens < 0:
+                    print(f"Warning: Sequence length {Seq} < expected patches {expected_patches}. Resizing logic mismatch.")
+                    # Fallback: assume all are patches? No, that breaks.
+                    continue
+                
+                # Take only the last 'expected_patches' tokens
+                spatial_tokens = last_hidden_state[0, -expected_patches:, :] # (N_patches, Dim)
+                
+                feat = spatial_tokens.cpu().numpy()
+            t_end = time.time()
+            inference_times.append(t_end - t_start)
+                
+            # Run PCA
+            pca_feat = run_pca(feat)
+            
+            # Save
+            base_name = os.path.basename(img_path)
+            name, _ = os.path.splitext(base_name)
+            save_path = os.path.join(args.output_dir, f"{name}_pca.png")
+            
+            plot_pca(pca_feat, h_patches, w_patches, save_path)
+            # print(f"Saved PCA to {save_path}")
+            
+        except Exception as e:
+            print(f"Failed to process {img_path}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    if inference_times:
+        mean_time = np.mean(inference_times)
+        mean_hz = 1.0 / mean_time
+        print(f"\n--- Performance Summary ---")
+        print(f"Model Used: {args.model}")
+        print(f"Processed {len(image_files)} images.")
+        print(f"Average Inference Time: {mean_time*1000:.2f} ms")
+        print(f"Mean Inference Hz: {mean_hz:.2f} Hz")
+
+if __name__ == "__main__":
+    main()
