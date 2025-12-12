@@ -78,7 +78,91 @@ def load_model(model_name):
             
             # Load state dict
             # Note: HF models often prefix keys differently or might match exactly if converted faithfully.
-            # We try strict=False to be safe.
+            
+            def remap_hf_to_dinov3(state_dict):
+                new_dict = {}
+                # Extract QKV keys to fuse later
+                qkv_map = {} # {layer_idx: {'q': w, 'k': w, 'v': w, 'q_b': b, ...}}
+                
+                for k, v in state_dict.items():
+                    # Patch Embeddings
+                    if k == "embeddings.patch_embeddings.weight":
+                        new_dict["patch_embed.proj.weight"] = v
+                    elif k == "embeddings.patch_embeddings.bias":
+                        new_dict["patch_embed.proj.bias"] = v
+                    elif k == "embeddings.cls_token":
+                        new_dict["cls_token"] = v
+                    elif k == "embeddings.mask_token":
+                        new_dict["mask_token"] = v
+                    elif k == "embeddings.register_tokens":
+                        # DINOv3 might explicitly have register tokens or part of variable length
+                        # Native: likely 'register_tokens' if it exists, or handled elsewhere.
+                        # Let's try direct mapping if missing
+                        pass 
+                    
+                    # Blocks
+                    elif k.startswith("layer."):
+                        parts = k.split(".")
+                        idx = parts[1]
+                        block_prefix = f"blocks.{idx}"
+                        suffix = ".".join(parts[2:]) # attention.q_proj.weight
+                        
+                        # Norms
+                        if "norm1" in suffix:
+                            new_dict[f"{block_prefix}.norm1.{parts[-1]}"] = v
+                        elif "norm2" in suffix:
+                            new_dict[f"{block_prefix}.norm2.{parts[-1]}"] = v
+                        elif "layer_scale1" in suffix:
+                             new_dict[f"{block_prefix}.ls1.gamma"] = v
+                        elif "layer_scale2" in suffix:
+                             new_dict[f"{block_prefix}.ls2.gamma"] = v
+                        
+                        # MLP
+                        # HF: mlp.up_proj (fc1), mlp.down_proj (fc2)? 
+                        # Native: mlp.fc1, mlp.fc2
+                        elif "mlp.fc1" in suffix or "mlp.up_proj" in suffix: # HF often calls it fc1 too or up_proj
+                             # Check specific naming in HF checkpoint from error log: 'layer.0.mlp.up_proj.weight'
+                             if "up_proj" in suffix:
+                                 new_dict[f"{block_prefix}.mlp.fc1.{parts[-1]}"] = v
+                        elif "mlp.fc2" in suffix or "mlp.down_proj" in suffix:
+                             if "down_proj" in suffix:
+                                 new_dict[f"{block_prefix}.mlp.fc2.{parts[-1]}"] = v
+
+                        # Attention (QKV Fusion)
+                        elif "attention" in suffix:
+                            # layer.0.attention.q_proj.weight
+                            # Native: blocks.0.attn.qkv.weight
+                            if "q_proj" in suffix:
+                                qkv_map.setdefault(idx, {}).setdefault('q_' + parts[-1], v)
+                            elif "k_proj" in suffix:
+                                qkv_map.setdefault(idx, {}).setdefault('k_' + parts[-1], v)
+                            elif "v_proj" in suffix:
+                                qkv_map.setdefault(idx, {}).setdefault('v_' + parts[-1], v)
+                            elif "o_proj" in suffix:
+                                new_dict[f"{block_prefix}.attn.proj.{parts[-1]}"] = v
+
+                # Fuse QKV
+                for idx, vals in qkv_map.items():
+                    # Weights
+                    if 'q_weight' in vals and 'k_weight' in vals and 'v_weight' in vals:
+                        # Concat along output dim (dim=0)
+                        q = vals['q_weight']
+                        k = vals['k_weight']
+                        v = vals['v_weight']
+                        fused_w = torch.cat([q, k, v], dim=0)
+                        new_dict[f"blocks.{idx}.attn.qkv.weight"] = fused_w
+                    
+                    # Biases
+                    if 'q_bias' in vals and 'k_bias' in vals and 'v_bias' in vals:
+                        q_b = vals['q_bias']
+                        k_b = vals['k_bias']
+                        v_b = vals['v_bias']
+                        fused_b = torch.cat([q_b, k_b, v_b], dim=0)
+                        new_dict[f"blocks.{idx}.attn.qkv.bias"] = fused_b
+                
+                return new_dict
+
+            state_dict = remap_hf_to_dinov3(state_dict)
             msg = model.load_state_dict(state_dict, strict=False)
             print(f"Weights loaded. Missing/Unexpected keys: {msg}")
             
@@ -125,7 +209,14 @@ def main():
     model, processor = load_model(args.model)
     
     # Get patch size from model config if possible
-    patch_size = getattr(model.config, "patch_size", 14) 
+    # Determine patch size (DINOv3 default is 14)
+    # Native model doesn't have a config attribute, so we check patch_embed or default to 14
+    if hasattr(model, "patch_embed"):
+        patch_size = model.patch_embed.patch_size
+        if isinstance(patch_size, tuple):
+             patch_size = patch_size[0]
+    else:
+        patch_size = 14
     print(f"Using patch size: {patch_size}")
 
     image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
