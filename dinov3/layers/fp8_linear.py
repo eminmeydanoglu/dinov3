@@ -43,7 +43,14 @@ def matmul(first, amax_first, second_t, amax_second_t, bias):
     return output
 
 
-@torch.compiler.allow_in_graph
+if hasattr(torch, "compiler"):
+    allow_in_graph = torch.compiler.allow_in_graph
+else:
+    # No-op decorator if torch.compiler is missing
+    def allow_in_graph(func):
+        return func
+
+@allow_in_graph
 class Fp8LinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, a, b_t, bias):
