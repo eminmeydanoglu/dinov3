@@ -91,15 +91,11 @@ def load_model(model_name):
                     elif k == "embeddings.patch_embeddings.bias":
                         new_dict["patch_embed.proj.bias"] = v
                     elif k == "embeddings.cls_token":
-                        val = v
-                        if val.ndim == 2:
-                            val = val.unsqueeze(1)
-                        new_dict["cls_token"] = val
+                        # Model expects [1, 1, D]
+                        new_dict["cls_token"] = v.reshape(1, 1, -1)
                     elif k == "embeddings.mask_token":
-                        val = v
-                        if val.ndim == 2:
-                            val = val.unsqueeze(1)
-                        new_dict["mask_token"] = val
+                        # Model expects [1, D]
+                        new_dict["mask_token"] = v.reshape(1, -1)
                     elif k == "embeddings.register_tokens":
                         # DINOv3 might explicitly have register tokens or part of variable length
                         # Native: likely 'register_tokens' if it exists, or handled elsewhere.
