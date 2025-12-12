@@ -20,29 +20,74 @@ def get_args():
     parser.add_argument("--img_size", type=int, default=770, help="Resize images to this size (should be divisible by patch size).")
     return parser.parse_args()
 
+from huggingface_hub import hf_hub_download
+
 def load_model(model_name):
     print(f"Loading model: {model_name}")
+    
+    # 1. Setup Processor (Robust fallback)
     try:
+        processor = AutoImageProcessor.from_pretrained(model_name)
+    except Exception as e_proc:
+        print(f"AutoImageProcessor failed ({e_proc}), falling back to ViTImageProcessor.")
         try:
-            processor = AutoImageProcessor.from_pretrained(model_name)
-        except Exception as e_proc:
-            print(f"AutoImageProcessor failed ({e_proc}), falling back to standard ViTImageProcessor.")
-            try:
-                processor = ViTImageProcessor.from_pretrained(model_name)
-            except Exception:
-                print("ViTImageProcessor.from_pretrained failed, using manual defaults.")
-                processor = ViTImageProcessor(
-                    do_resize=True,
-                    size={"height": 224, "width": 224}, 
-                    image_mean=[0.485, 0.456, 0.406],
-                    image_std=[0.229, 0.224, 0.225],
-                    resample=3 
-                )
+            processor = ViTImageProcessor.from_pretrained(model_name)
+        except Exception:
+            print("ViTImageProcessor failed, using manual defaults.")
+            processor = ViTImageProcessor(
+                do_resize=True,
+                size={"height": 224, "width": 224}, 
+                image_mean=[0.485, 0.456, 0.406],
+                image_std=[0.229, 0.224, 0.225],
+                resample=3 
+            )
 
+    # 2. Setup Model
+    try:
+        # Try AutoModel first
         model = AutoModel.from_pretrained(model_name, device_map="auto", trust_remote_code=True)
     except Exception as e:
-        print(f"Error loading model {model_name}: {e}")
-        raise e
+        print(f"AutoModel failed ({e}). Attempting manual load from dinov3 library...")
+        try:
+            # Import architecture from local code
+            from dinov3.hub.backbones import dinov3_vits16, dinov3_vitl16
+            
+            if "vits16" in model_name:
+                model_fn = dinov3_vits16
+            elif "vitl16" in model_name:
+                model_fn = dinov3_vitl16
+            else:
+                # Default fallback or error
+                print("Could not infer arch from name, assuming vits16")
+                model_fn = dinov3_vits16
+            
+            print(f"Instantiating {model_fn.__name__}...")
+            model = model_fn(pretrained=False)
+            
+            print("Downloading weights from HF...")
+            # Try safetensors first, then bin
+            try:
+                weights_path = hf_hub_download(repo_id=model_name, filename="model.safetensors")
+                from safetensors.torch import load_file
+                state_dict = load_file(weights_path)
+            except Exception as e_safetensor:
+                print(f"Safetensors load failed ({e_safetensor}), trying pytorch_model.bin")
+                weights_path = hf_hub_download(repo_id=model_name, filename="pytorch_model.bin")
+                state_dict = torch.load(weights_path, map_location="cpu")
+            
+            # Load state dict
+            # Note: HF models often prefix keys differently or might match exactly if converted faithfully.
+            # We try strict=False to be safe.
+            msg = model.load_state_dict(state_dict, strict=False)
+            print(f"Weights loaded. Missing/Unexpected keys: {msg}")
+            
+            model.cuda()
+            model.eval()
+            
+        except Exception as manual_e:
+            print(f"Manual loading failed: {manual_e}")
+            raise e
+
     return model, processor
 
 def run_pca(features, n_components=3):
