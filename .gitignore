@@ -16,3 +16,7 @@ dist/
 
 # Ignore vscode directory
 .vscode/
+
+# Virtual Environment
+.venv
+.venv311
