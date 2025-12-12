@@ -7,7 +7,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import numpy as np
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoImageProcessor, AutoModel, ViTImageProcessor
 
 PATCH_SIZE = 14 
 
@@ -23,8 +23,23 @@ def get_args():
 def load_model(model_name):
     print(f"Loading model: {model_name}")
     try:
-        processor = AutoImageProcessor.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name, device_map="auto")
+        try:
+            processor = AutoImageProcessor.from_pretrained(model_name)
+        except Exception as e_proc:
+            print(f"AutoImageProcessor failed ({e_proc}), falling back to standard ViTImageProcessor.")
+            try:
+                processor = ViTImageProcessor.from_pretrained(model_name)
+            except Exception:
+                print("ViTImageProcessor.from_pretrained failed, using manual defaults.")
+                processor = ViTImageProcessor(
+                    do_resize=True,
+                    size={"height": 224, "width": 224}, 
+                    image_mean=[0.485, 0.456, 0.406],
+                    image_std=[0.229, 0.224, 0.225],
+                    resample=3 
+                )
+
+        model = AutoModel.from_pretrained(model_name, device_map="auto", trust_remote_code=True)
     except Exception as e:
         print(f"Error loading model {model_name}: {e}")
         raise e
